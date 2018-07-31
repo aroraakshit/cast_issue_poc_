@@ -13,19 +13,6 @@
 # limitations under the License.
 # ==============================================================================
 
-r"""Binary for trianing a RNN-based classifier for the Quick, Draw! data.
-
-python train_model.py \
-  --training_data train_data \
-  --eval_data eval_data \
-  --model_dir /tmp/quickdraw_model/ \
-  --cell_type cudnn_lstm
-
-When running on GPUs using --cell_type cudnn_lstm is much faster.
-
-The expected performance is ~75% in 1.5M steps with the default configuration.
-"""
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -63,15 +50,15 @@ def get_input_fn(mode, tfrecord_pattern, batch_size):
         "ink": tf.VarLenFeature(dtype=tf.float32),
         "shape": tf.FixedLenFeature([2], dtype=tf.int64)
     }
-    if mode != tf.estimator.ModeKeys.PREDICT:
+    # if mode != tf.estimator.ModeKeys.PREDICT:
       # The labels won't be available at inference time, so don't add them
       # to the list of feature_columns to be read.
-      feature_to_type["class_index"] = tf.FixedLenFeature([1], dtype=tf.int64)
+    feature_to_type["class_index"] = tf.FixedLenFeature([1], dtype=tf.int64)
 
     parsed_features = tf.parse_single_example(example_proto, feature_to_type)
     labels = None
-    if mode != tf.estimator.ModeKeys.PREDICT:
-      labels = parsed_features["class_index"]
+    # if mode != tf.estimator.ModeKeys.PREDICT:
+    labels = parsed_features["class_index"]
     parsed_features["ink"] = tf.sparse_tensor_to_dense(parsed_features["ink"])
     return parsed_features, labels
 
@@ -134,9 +121,10 @@ def model_fn(features, labels, mode, params):
     # inks will be a dense tensor of [8, maxlen, 3]
     # shapes is [batchsize, 2]
     shapes = features["shape"]
+    
     # lengths will be [batch_size]
-    lengths = tf.squeeze(
-        tf.slice(shapes, begin=[0, 0], size=[params.batch_size, 1]))
+
+    lengths = tf.squeeze(tf.slice(shapes, begin=[0, 0], size=[params.batch_size, 1]))
     inks = tf.reshape(features["ink"], [params.batch_size, -1, 3])
     if labels is not None:
       labels = tf.squeeze(labels)
@@ -225,27 +213,34 @@ def model_fn(features, labels, mode, params):
   convolved, lengths = _add_conv_layers(inks, lengths)
   final_state = _add_rnn_layers(convolved, lengths)
   logits = _add_fc_layers(final_state)
-  # Add the loss.
-  cross_entropy = tf.reduce_mean(
-      tf.nn.sparse_softmax_cross_entropy_with_logits(
-          labels=labels, logits=logits))
-  # Add the optimizer.
-  train_op = tf.contrib.layers.optimize_loss(
-      loss=cross_entropy,
-      global_step=tf.train.get_global_step(),
-      learning_rate=params.learning_rate,
-      optimizer="Adam",
-      # some gradient clipping stabilizes training in the beginning.
-      clip_gradients=params.gradient_clipping_norm,
-      summaries=["learning_rate", "loss", "gradients", "gradient_norm"])
+  if mode != tf.estimator.ModeKeys.PREDICT:
+    # Add the loss.
+    cross_entropy = tf.reduce_mean(
+        tf.nn.sparse_softmax_cross_entropy_with_logits(
+            labels=labels, logits=logits))
+    # Add the optimizer.
+    train_op = tf.contrib.layers.optimize_loss(
+        loss=cross_entropy,
+        global_step=tf.train.get_global_step(),
+        learning_rate=params.learning_rate,
+        optimizer="Adam",
+        # some gradient clipping stabilizes training in the beginning.
+        clip_gradients=params.gradient_clipping_norm,
+        summaries=["learning_rate", "loss", "gradients", "gradient_norm"])
   # Compute current predictions.
   predictions = tf.argmax(logits, axis=1)
-  return tf.estimator.EstimatorSpec(
+  if mode != tf.estimator.ModeKeys.PREDICT:
+    return tf.estimator.EstimatorSpec(
       mode=mode,
       predictions={"logits": logits, "predictions": predictions},
       loss=cross_entropy,
       train_op=train_op,
       eval_metric_ops={"accuracy": tf.metrics.accuracy(labels, predictions)})
+  else:
+    return tf.estimator.EstimatorSpec(
+        mode=mode,
+        predictions={"logits": logits, "predictions": predictions},
+        export_outputs= {"output": tf.estimator.export.ClassificationOutput(logits,tf.cast(predictions, tf.string))})
 
 
 def create_estimator_and_specs(run_config):
@@ -287,7 +282,27 @@ def main(unused_args):
           model_dir=FLAGS.model_dir,
           save_checkpoints_secs=300,
           save_summary_steps=100))
-  tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+  if(FLAGS.export):
+      print("exporting now")
+      # Using https://www.tensorflow.org/guide/saved_model#using_savedmodel_with_estimators
+      feature_spec = {
+        "ink": tf.VarLenFeature(dtype=tf.float32),
+        "shape": tf.FixedLenFeature([2], dtype=tf.int64),
+        "class_index": tf.FixedLenFeature([1], dtype=tf.int64)
+      }
+
+      # defining serving input receiver function
+      def serving_input_receiver_fn():
+        serialized_tf_example = tf.placeholder(dtype=tf.string, shape=[None], name='input_example_tensor')
+        receiver_tensors = {'examples': serialized_tf_example}
+        parsed_features = tf.parse_example(serialized_tf_example, feature_spec)
+        parsed_features["ink"] = tf.sparse_tensor_to_dense(parsed_features["ink"])
+        return tf.estimator.export.ServingInputReceiver(parsed_features, receiver_tensors)
+      # export saved model
+      estimator.export_savedmodel("serve/", serving_input_receiver_fn, strip_default_attrs=True)
+      print("done exporting")
+  else:
+    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
 
 
 if __name__ == "__main__":
@@ -306,7 +321,7 @@ if __name__ == "__main__":
   parser.add_argument(
       "--classes_file",
       type=str,
-      default="",
+      default="../training.tfrecord.classes",
       help="Path to a file with the classes - one class per line")
   parser.add_argument(
       "--num_layers",
@@ -366,13 +381,18 @@ if __name__ == "__main__":
   parser.add_argument(
       "--model_dir",
       type=str,
-      default="",
+      default="../model/",
       help="Path for storing the model checkpoints.")
   parser.add_argument(
       "--self_test",
       type="bool",
       default="False",
       help="Whether to enable batch normalization or not.")
+  parser.add_argument(
+    "--export",
+    type="bool",
+    default="False",
+    help="Whether to export model or not.")
 
   FLAGS, unparsed = parser.parse_known_args()
   tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
