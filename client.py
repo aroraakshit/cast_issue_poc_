@@ -52,7 +52,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', help='Tensorflow server host name', default='0.0.0.0', type=str)
     parser.add_argument('--port', help='Tensorflow server port number', default=9000, type=int)
     parser.add_argument('--input', help='input string', type=str)
-    parser.add_argument('--model', help='model name', default="1532724024", type=str)
+    parser.add_argument('--model', help='model name', default="", type=str)
     parser.add_argument('--signature_name', help='Signature name of saved TF model', default='serving_default', type=str)
 
     args = parser.parse_args()
